@@ -39,9 +39,11 @@ import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import org.apache.commons.io.FileUtils;
+import org.omegat.core.data.ProjectProperties;
 import org.omegat.core.team2.IRemoteRepository2.NetworkException;
 import org.omegat.util.FileUtil;
 import org.omegat.util.Log;
+import org.omegat.util.OConsts;
 import org.omegat.util.StringUtil;
 
 import gen.core.project.RepositoryDefinition;
@@ -65,15 +67,35 @@ public class RemoteRepositoryProvider {
     final ProjectTeamSettings teamSettings;
     final List<RepositoryDefinition> repositoriesDefinitions;
     final List<IRemoteRepository2> repositories = new ArrayList<IRemoteRepository2>();
+    /**
+     * exclude some path like .git, .svn, project_save.tmx and glossary.txt when copying files from repo to project.
+     */
+    private String[] forceExcludes = {};
+    private List<Mapping> mappingsWithFileListSnapshot;
 
-    public RemoteRepositoryProvider(File projectRoot, List<RepositoryDefinition> repositoriesDefinitions)
+    public RemoteRepositoryProvider(File projectRoot, List<RepositoryDefinition> repositoriesDefinitions, ProjectProperties props)
             throws Exception {
+        this(projectRoot, repositoriesDefinitions);
+        setForceExcludesFromProjectProperties(props);
+
+    }
+    public RemoteRepositoryProvider(File projectRoot, List<RepositoryDefinition> repositoriesDefinitions) throws Exception {
         this.projectRoot = projectRoot;
         teamSettings = new ProjectTeamSettings(new File(projectRoot, REPO_SUBDIR));
         this.repositoriesDefinitions = repositoriesDefinitions;
 
         checkDefinitions();
         initializeRepositories();
+    }
+
+    public void setForceExcludesFromProjectProperties(ProjectProperties props) {
+        this.forceExcludes = new String[]{
+                '/' + RemoteRepositoryProvider.REPO_SUBDIR,
+                '/' + RemoteRepositoryProvider.REPO_GIT_SUBDIR, '/' + RemoteRepositoryProvider.REPO_SVN_SUBDIR,
+                '/' + OConsts.FILE_PROJECT,
+                '/' + props.getProjectInternalRelative() + OConsts.STATUS_EXTENSION,
+                '/' + props.getWritableGlossaryFile().getUnderRoot(),
+                '/' + props.getTargetDir().getUnderRoot()};
     }
 
     public ProjectTeamSettings getTeamSettings() {
@@ -171,6 +193,7 @@ public class RemoteRepositoryProvider {
      */
     public void switchAllToLatest() throws Exception {
         List<Exception> errors = new ArrayList<>();
+
         for (IRemoteRepository2 r : repositories) {
             try {
                 r.switchToVersion(null);
@@ -181,6 +204,7 @@ public class RemoteRepositoryProvider {
                 Log.logErrorRB("TEAM_UPDATE_REPO_ERROR", e.getMessage());
             }
         }
+
         if (!errors.isEmpty()) {
             throw errors.get(0);
         }
@@ -221,11 +245,10 @@ public class RemoteRepositoryProvider {
      *
      * @param localPath
      *            directory name or file name
-     * @param forceExcludes
-     *            exclude some path like project_save.tmx and glossary.txt
      */
-    public void copyFilesFromRepoToProject(String localPath, String... forceExcludes) throws Exception {
-        for (Mapping m : getMappings(localPath, forceExcludes)) {
+    public void copyFilesFromReposToProject(String localPath) throws Exception {
+        String[] myForceExcludes = "".equals(localPath) ? forceExcludes : new String[]{};
+        for (Mapping m : getMappings(localPath, myForceExcludes)) {
             m.copyFromRepoToProject();
         }
     }
@@ -239,7 +262,7 @@ public class RemoteRepositoryProvider {
      *            not null if EOL conversion required. EOL will be converted to repository-specific for
      *            existing files, and to platform-specific for new files
      */
-    public void copyFilesFromProjectToRepo(String localPath, String eolConversionCharset) throws Exception {
+    public void copyFilesFromProjectToRepos(String localPath, String eolConversionCharset) throws Exception {
         for (Mapping m : getMappings(localPath)) {
             m.copyFromProjectToRepo(eolConversionCharset);
         }
@@ -295,6 +318,23 @@ public class RemoteRepositoryProvider {
         return withoutTrailingSlash(withoutLeadingSlash(s));
     }
 
+    private void createFileListSnapshotIfNotExists() throws Exception {
+        if (mappingsWithFileListSnapshot != null) return;
+        List<Mapping> mappings = getMappings("", this.forceExcludes);
+        for (Mapping m : mappings) {
+            m.makeFileListSnapshot();
+        }
+        mappingsWithFileListSnapshot = mappings;
+    }
+
+    public void propagateDeletes() throws Exception {
+        if (mappingsWithFileListSnapshot == null) return;
+        for (Mapping m : mappingsWithFileListSnapshot) {
+            m.deleteDeletedFilesSinceLastSnapshot();
+        }
+        mappingsWithFileListSnapshot = null;
+    }
+
     /**
      * Class for mapping by specified local path.
      */
@@ -304,6 +344,8 @@ public class RemoteRepositoryProvider {
         final RepositoryDefinition repoDefinition;
         final RepositoryMapping repoMapping;
         final List<String> forceExcludes;
+
+        List<String> fileListSnapshot;
 
         Mapping(String path, IRemoteRepository2 repo, RepositoryDefinition repoDefinition,
                 RepositoryMapping repoMapping, String... forceExcludes) {
@@ -412,6 +454,7 @@ public class RemoteRepositoryProvider {
         }
 
         public File switchToVersion(String version) throws Exception {
+            createFileListSnapshotIfNotExists();
             repo.switchToVersion(version);
             File to = new File(getRepositoryDir(repoDefinition), repoMapping.getRepository());
             return new File(to, filterPrefix);
@@ -441,6 +484,52 @@ public class RemoteRepositoryProvider {
                 }
             }
             return copied;
+        }
+
+        protected void makeFileListSnapshot() throws Exception {
+            fileListSnapshot = getMappedFiles();
+        }
+
+        /**
+         * my new function!
+         * @return
+         * @throws Exception
+         */
+        private List<String> getMappedFiles() throws Exception {
+            if (!matches()) {
+                throw new RuntimeException("Doesn't match");
+            }
+            // Remove leading slashes on child args to avoid doing `new
+            // File("foo", "/")` which treats the "/" as an actual child element
+            // name and prevents proper slash normalization later on.
+            File from = new File(getRepositoryDir(repoDefinition), withoutLeadingSlash(repoMapping.getRepository()));
+            if (from.isDirectory()) {
+                // directory mapping
+                List<String> excludes = new ArrayList<>(repoMapping.getExcludes());
+                excludes.addAll(forceExcludes);
+                return FileUtil.buildRelativeFilesList(from, repoMapping.getIncludes(), excludes);
+            } else {
+                // file mapping, no need to track deletions, so return empty.
+                //(also: file mapping can have different filename locally than on remote)
+                return new ArrayList<>();
+            }
+        }
+
+        public void deleteDeletedFilesSinceLastSnapshot() throws Exception {
+            List<String> newFileListSnapshot = getMappedFiles();
+            List<String> toDeleteFiles = fileListSnapshot;
+            toDeleteFiles.removeAll(newFileListSnapshot);
+
+            File mappingRoot = new File(projectRoot, withoutLeadingSlash(repoMapping.getLocal()));
+            for (String relativeFile:toDeleteFiles) {
+                File deleteFile = new File(mappingRoot, relativeFile);
+                if (!deleteFile.delete()) {
+                    Log.logInfoRB("LOG_ERROR_DELETE_FILE", deleteFile.toString());
+                }
+
+            }
+
+            fileListSnapshot = null;
         }
     }
 }
